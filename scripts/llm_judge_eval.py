@@ -424,8 +424,20 @@ def format_report(report: dict) -> str:
 
 
 def send_telegram(text: str) -> bool:
-    token = "8513147842:AAELF3fKf99MVlnIf37_swDVjJMKKm8eDy4"
-    chat_id = "5065264208"
+    # Read token from environment or Hermes .env file
+    env_path = Path.home() / ".hermes" / ".env"
+    token = None
+    if env_path.exists():
+        for line in env_path.read_text().splitlines():
+            if line.startswith("TELEGRAM_BOT_TOKEN="):
+                token = line.split("=", 1)[1].strip()
+                break
+    
+    if not token:
+        print("⚠️  TELEGRAM_BOT_TOKEN not found, skipping alert")
+        return False
+    
+    chat_id = "5065264208"  # Your Telegram user ID
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = json.dumps({"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}).encode("utf-8")
     try:
