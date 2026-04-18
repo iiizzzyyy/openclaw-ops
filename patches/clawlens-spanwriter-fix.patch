@@ -1,0 +1,175 @@
+--- clawlens/dist/index.js.orig	2026-04-18 15:40:00.000000000 +0200
++++ clawlens/dist/index.js	2026-04-18 15:40:04.000000000 +0200
+@@ -344,9 +344,20 @@
+   db;
+   insertStmt;
+   updateStmt;
++  writeAttempts = 0;
++  writeFailures = 0;
++  
+   constructor(db) {
+     this.db = db;
+-    this.insertStmt = db.prepare(`
++    this.initializeStatements();
++  }
++  
++  /**
++   * Initialize prepared statements
++   * Called on construction and re-initialization after connection issues
++   */
++  initializeStatements() {
++    this.insertStmt = this.db.prepare(`
+       INSERT INTO spans (
+         id, trace_id, parent_id, session_id, session_key, agent_id,
+         channel, account_id, conversation_id,
+@@ -363,7 +374,7 @@
+         @run_id, @sequence_num, @source, @metadata, @created_at
+       )
+     `);
+-    this.updateStmt = db.prepare(`
++    this.updateStmt = this.db.prepare(`
+       UPDATE spans SET
+         end_ts = COALESCE(@end_ts, end_ts),
+         status = COALESCE(@status, status),
+@@ -383,12 +394,68 @@
+       WHERE id = @id
+     `);
+   }
++  
+   /**
+-   * Write a single span to the database
++   * Re-initialize database connection and prepared statements
++   * Called when writes fail due to stale connection
++   */
++  reconnect() {
++    try {
++      // Close old connection if possible
++      if (this.db) {
++        this.db.close();
++      }
++      // Re-open connection
++      const { getDb } = require('better-sqlite3');
++      const dbPath = this.db.path || this.db.filename;
++      this.db = getDb({ path: dbPath });
++      this.initializeStatements();
++      console.log('[clawlens] SpanWriter: Database reconnected successfully');
++      return true;
++    } catch (error) {
++      console.error('[clawlens] SpanWriter: Reconnection failed:', error.message);
++      return false;
++    }
++  }
++  
++  /**
++   * Write a single span to the database with error handling and auto-reconnect
+    */
+   writeSpan(span) {
+-    const row = spanToRow(span);
+-    this.insertStmt.run(row);
++    this.writeAttempts++;
++    try {
++      const row = spanToRow(span);
++      this.insertStmt.run(row);
++    } catch (error) {
++      this.writeFailures++;
++      console.error('[clawlens] SpanWriter: writeSpan failed:', error.message);
++      
++      // Check if it's a database connection error
++      const isDbError = error.message.includes('database') || 
++                        error.message.includes('SQLITE') ||
++                        error.message.includes('closed') ||
++                        error.message.includes('invalid');
++      
++      if (isDbError && this.writeAttempts > 1) {
++        // Attempt to reconnect
++        console.log('[clawlens] SpanWriter: Attempting database reconnection...');
++        if (this.reconnect()) {
++          // Retry the write
++          try {
++            const row = spanToRow(span);
++            this.insertStmt.run(row);
++            console.log('[clawlens] SpanWriter: Write succeeded after reconnect');
++            return;
++          } catch (retryError) {
++            console.error('[clawlens] SpanWriter: Retry failed:', retryError.message);
++          }
++        }
++      }
++      
++      // Log failure metrics
++      const failureRate = (this.writeFailures / this.writeAttempts * 100).toFixed(2);
++      console.error(`[clawlens] SpanWriter: Write failure rate: ${failureRate}% (${this.writeFailures}/${this.writeAttempts})`);
++    }
+   }
+   /**
+    * Write multiple spans in a single transaction (batched insert) with error handling
+@@ -458,17 +525,61 @@
+     }
+   }
+   /**
+-   * Write multiple spans in a single transaction (batched insert)
++   * Write multiple spans in a single transaction (batched insert) with error handling
+    */
+   writeSpans(spans) {
+     if (spans.length === 0) return;
+-    const insertMany = this.db.transaction((spans2) => {
+-      for (const span of spans2) {
+-        const row = spanToRow(span);
+-        this.insertStmt.run(row);
+-      }
+-    });
+-    insertMany(spans);
++    
++    try {
++      const insertMany = this.db.transaction((spans2) => {
++        for (const span of spans2) {
++          const row = spanToRow(span);
++          this.insertStmt.run(row);
++        }
++      });
++      insertMany(spans);
++    } catch (error) {
++      console.error('[clawlens] SpanWriter: writeSpans failed:', error.message);
++      
++      const isDbError = error.message.includes('database') || 
++                        error.message.includes('SQLITE') ||
++                        error.message.includes('closed') ||
++                        error.message.includes('invalid');
++      
++      if (isDbError) {
++        console.log('[clawlens] SpanWriter: Attempting database reconnection for batch write...');
++        if (this.reconnect()) {
++          try {
++            const insertMany = this.db.transaction((spans2) => {
++              for (const span of spans2) {
++                const row = spanToRow(span);
++                this.insertStmt.run(row);
++              }
++            });
++            insertMany(spans);
++            console.log('[clawlens] SpanWriter: Batch write succeeded after reconnect');
++            return;
++          } catch (retryError) {
++            console.error('[clawlens] SpanWriter: Batch retry failed:', retryError.message);
++          }
++        }
++      }
++      
++      // Fallback: write spans individually (some may succeed)
++      console.log('[clawlens] SpanWriter: Falling back to individual writes...');
++      let successCount = 0;
++      let failCount = 0;
++      for (const span of spans) {
++        try {
++          const row = spanToRow(span);
++          this.insertStmt.run(row);
++          successCount++;
++        } catch (e) {
++          failCount++;
++        }
++      }
++      console.log(`[clawlens] SpanWriter: Individual writes complete: ${successCount} succeeded, ${failCount} failed`);
++    }
+   }
+   /**
+    * Start a new span and return its ID
