@@ -77,13 +77,13 @@ Health monitor (`~/clawd/scripts/clawlens_health_monitor.py`) now:
 - `~/clawd/scripts/clawlens_health_monitor.py` (workaround implementation)
 - `~/clawd/repos/openclaw-ops/scripts/clawlens_health_monitor.py` (repo copy)
 
-## Next Steps
-1. [ ] File GitHub issue on OpenClaw repo
-2. [ ] Add DB connection health monitoring
-3. [ ] Implement proper error handling in SpanWriter
-4. [ ] Test with connection re-initialization logic
-5. [ ] Consider periodic DB reconnection (every 30 min)
+## Status
+**✅ FIXED** - 2026-04-18
 
----
-**Discovered:** 2026-04-18  
-**Status:** Workaround implemented, root cause identified, fix pending
+Applied patch to `SpanWriter` class with:
+- Error handling for all write operations
+- Auto-reconnect on database connection failures
+- Retry logic with fallback to individual writes
+- Failure metrics and logging
+
+Gateway restarted with fix loaded. Sessions now being captured correctly.
