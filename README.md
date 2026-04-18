@@ -195,17 +195,17 @@ If I can't describe the fix in six steps, the script shouldn't be doing it.
 
 ## Configuration
 
-### Environment Variables
+# Environment Variables
 
 Create `~/.hermes/.env` (or copy from Hermes config):
 
 ```bash
 # Telegram (for alerts)
-TELEGRAM_BOT_TOKEN=8513147842:AAH...
+TELEGRAM_BOT_TOKEN=your-bot-token-here
 TELEGRAM_ALLOWED_USERS=5065264208
 
 # Ollama Cloud API (for LLM judge)
-OLLAMA_API_KEY=24d63b936da743019cf6dc079bb0f24c.ziiY5kUTCRiiXAJlOS6lmX_d
+OLLAMA_API_KEY=your-ollama-api-key-here
 ```
 
 ### OpenClaw Config
