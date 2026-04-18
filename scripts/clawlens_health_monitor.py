@@ -78,6 +78,42 @@ def get_recent_sessions(hours: int = 1) -> list:
     result = clawlens_request("sessions", {"fromTs": from_ts, "limit": 100})
     return result.get("data", []) if "data" in result else []
 
+def get_disk_sessions(hours: int = 1) -> list:
+    """Get session files modified in the last N hours from disk."""
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=hours)
+    
+    sessions_dir = Path.home() / ".openclaw" / "agents"
+    recent_files = []
+    
+    if not sessions_dir.exists():
+        return []
+    
+    # Find all JSONL files modified in last N hours
+    for jsonl_file in sessions_dir.rglob("*.jsonl"):
+        try:
+            mtime = datetime.fromtimestamp(jsonl_file.stat().st_mtime, tz=timezone.utc)
+            if mtime > cutoff:
+                # Extract agent and session ID from path
+                # e.g., ~/.openclaw/agents/main/sessions/abc-123.jsonl
+                parts = jsonl_file.parts
+                if "agents" in parts:
+                    agent_idx = parts.index("agents") + 1
+                    agent_id = parts[agent_idx] if agent_idx < len(parts) else "unknown"
+                    session_id = jsonl_file.stem
+                    
+                    recent_files.append({
+                        "agentId": agent_id,
+                        "sessionId": session_id,
+                        "path": str(jsonl_file),
+                        "modifiedAt": mtime.isoformat(),
+                        "modifiedTs": int(mtime.timestamp() * 1000)
+                    })
+        except (OSError, ValueError):
+            continue
+    
+    return recent_files
+
 def get_bot_stats(hours: int = 1) -> dict:
     """Get per-agent stats for the last N hours."""
     now = datetime.now(timezone.utc)
@@ -97,12 +133,13 @@ def get_flow_events(since_ms: int = 0) -> list:
     result = clawlens_request("flow/events", {"since": since_ms})
     return result.get("data", []) if "data" in result else []
 
-def analyze_health(sessions: list, bot_stats: list, cron_summary: dict) -> HealthStatus:
+def analyze_health(sessions: list, bot_stats: list, cron_summary: dict, disk_sessions: list = None) -> HealthStatus:
     """Analyze ClawLens data for issues."""
     status = HealthStatus()
     
     # === Metrics Summary ===
     total_sessions = len(sessions)
+    total_disk_sessions = len(disk_sessions) if disk_sessions else 0
     total_errors = sum(1 for s in sessions if s.get("errorCount", 0) > 0)
     total_cost = sum(s.get("totalCost", 0) for s in sessions)
     total_tokens = sum(s.get("totalTokensIn", 0) + s.get("totalTokensOut", 0) for s in sessions)
@@ -117,12 +154,14 @@ def analyze_health(sessions: list, bot_stats: list, cron_summary: dict) -> Healt
     
     status.metrics = {
         "sessions": total_sessions,
+        "disk_sessions": total_disk_sessions,
         "errors": total_errors,
         "error_rate": f"{error_rate:.1%}",
         "cost_usd": f"${total_cost:.4f}",
         "tokens": f"{total_tokens:,}",
         "agents_active": len([b for b in bot_stats if b.get("spanCount", 0) > 0]),
         "agent_tokens": agent_tokens,  # For detailed breakdown
+        "ingestion_lag": total_disk_sessions > 0 and total_sessions == 0,
     }
     
     # === Check 1: Error Rate ===
@@ -198,22 +237,42 @@ def analyze_health(sessions: list, bot_stats: list, cron_summary: dict) -> Healt
                 f"Check cron job: {job.get('name', 'unknown')} — last error: {job.get('lastError', 'unknown')[:100]}"
             )
     
-    # === Check 5: Zero Activity (Silent Failure) ===
+    # === Check 5: Zero Activity vs Ingestion Lag ===
     if total_sessions == 0 and datetime.now().hour in range(7, 23):  # During active hours
-        status.issues.append(Issue(
-            severity="critical",
-            category="silence",
-            title="No Agent Activity Detected",
-            description="Zero sessions in the last hour during active hours",
-            affected_agents=[],
-            data={}
-        ))
-        status.status = "critical"
-        status.user_actions.append("Check if OpenClaw gateway is running: curl http://localhost:18789/health")
-        status.auto_fixes.append({
-            "action": "Restart OpenClaw gateway",
-            "details": "launchctl kickstart -k gui/$(id -u)/com.openclaw.gateway"
-        })
+        if total_disk_sessions > 0:
+            # Sessions exist on disk but not in ClawLens = ingestion lag
+            status.issues.append(Issue(
+                severity="warning",
+                category="ingestion_lag",
+                title=f"ClawLens Ingestion Lag Detected",
+                description=f"{total_disk_sessions} session files on disk, but 0 ingested into ClawLens",
+                affected_agents=list(set(s.get("agentId", "unknown") for s in (disk_sessions or []))),
+                data={"disk_sessions": total_disk_sessions, "clawlens_sessions": 0}
+            ))
+            status.status = "warning"
+            status.user_actions.append(
+                "ClawLens sync is delayed — sessions will appear once ingestion catches up"
+            )
+            status.auto_fixes.append({
+                "action": "Restart ClawLens sync (if lag persists >1 hour)",
+                "details": "launchctl kickstart -k gui/$(id -u)/com.openclaw.gateway"
+            })
+        else:
+            # No sessions anywhere = real problem
+            status.issues.append(Issue(
+                severity="critical",
+                category="silence",
+                title="No Agent Activity Detected",
+                description="Zero sessions in the last hour during active hours",
+                affected_agents=[],
+                data={}
+            ))
+            status.status = "critical"
+            status.user_actions.append("Check if OpenClaw gateway is running: curl http://localhost:18789/health")
+            status.auto_fixes.append({
+                "action": "Restart OpenClaw gateway",
+                "details": "launchctl kickstart -k gui/$(id -u)/com.openclaw.gateway"
+            })
     
     return status
 
@@ -230,10 +289,14 @@ def format_telegram_message(status: HealthStatus) -> str:
     # Metrics
     msg += "*📊 Metrics (Last Hour)*\n"
     for key, value in status.metrics.items():
-        if key == "agent_tokens":
-            continue  # Skip detailed breakdown for now
+        if key in ("agent_tokens", "ingestion_lag"):
+            continue  # Skip detailed breakdown and boolean flags
         label = key.replace("_", " ").title()
         msg += f"  • {label}: `{value}`\n"
+    
+    # Ingestion lag indicator
+    if status.metrics.get("ingestion_lag"):
+        msg += "  • *⚠️ Ingestion Lag*: Sessions on disk, not yet in ClawLens\n"
     
     # Per-agent token breakdown
     if status.metrics.get("agent_tokens"):
@@ -319,8 +382,11 @@ def main():
     print(f"[{datetime.now().isoformat()}] Starting ClawLens health check...")
     
     # Gather data
-    print("  → Fetching recent sessions...")
+    print("  → Fetching recent sessions from ClawLens...")
     sessions = get_recent_sessions(LOOKBACK_HOURS)
+    
+    print("  → Fetching session files from disk...")
+    disk_sessions = get_disk_sessions(LOOKBACK_HOURS)
     
     print("  → Fetching bot stats...")
     bot_stats = get_bot_stats(LOOKBACK_HOURS)
@@ -330,7 +396,7 @@ def main():
     
     # Analyze
     print("  → Analyzing health...")
-    status = analyze_health(sessions, bot_stats, cron_summary)
+    status = analyze_health(sessions, bot_stats, cron_summary, disk_sessions)
     
     # Format message
     message = format_telegram_message(status)
